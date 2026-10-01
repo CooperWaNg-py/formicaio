@@ -67,9 +67,7 @@ impl NodeManager {
         let native_nodes = NativeNodes::new(
             app_ctx.node_status_locked.clone(),
             data_dir_path,
-            nodes_in_db
-                .iter()
-                .filter_map(|(node_id, node_info)| node_info.pid.map(|pid| (node_id.clone(), pid))),
+            nodes_in_db.values(),
         )
         .await?;
         let node_manager = Self {
@@ -99,6 +97,18 @@ impl NodeManager {
         let nodes_list = node_manager
             .update_nodes_status(nodes_in_db, MetricsMode::Disabled)
             .await?;
+
+        // PIDs of nodes not found running are stale, and they could be reused by other processes
+        for node_info in nodes_list
+            .iter()
+            .filter(|n| n.status.is_inactive() && n.pid.is_some())
+        {
+            node_manager
+                .app_ctx
+                .db_client
+                .update_node_pid(&node_info.node_id, None)
+                .await;
+        }
 
         // let's create a batch to start nodes which were Active and were found inactive now
         let mut active_nodes = vec![];
@@ -274,6 +284,7 @@ impl NodeManager {
             }
         };
 
+        node_info.is_status_unknown = false;
         node_info.set_status_changed_now();
         self.app_ctx
             .db_client
@@ -333,8 +344,8 @@ impl NodeManager {
             .db_client
             .get_node_metadata(&mut node_info, true)
             .await;
-        if node_info.status.is_active() {
-            // kill node's process
+        // kill node's process if tracked, regardless of its status in the DB which may be out of date
+        if self.native_nodes.is_tracked(&node_info.node_id).await {
             self.native_nodes.kill_node(&node_info.node_id).await;
         }
 
@@ -402,6 +413,7 @@ impl NodeManager {
             }
         };
 
+        node_info.is_status_unknown = false;
         node_info.set_status_changed_now();
         self.app_ctx
             .db_client
@@ -448,6 +460,7 @@ impl NodeManager {
             }
         };
 
+        node_info.is_status_unknown = false;
         node_info.set_status_changed_now();
         self.app_ctx
             .db_client

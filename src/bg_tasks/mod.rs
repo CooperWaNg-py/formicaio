@@ -18,7 +18,7 @@ use super::{
 
 pub use agent::AgentContext;
 pub(crate) use arbitrum_client::PaymentRecord;
-pub use batches::{ActionsBatchError, prepare_node_action_batch};
+pub use batches::{ActionsBatchError, prepare_node_action_batch, unlock_batched_nodes};
 pub use mcp::start_mcp_server;
 pub use metrics_client::NodesMetrics;
 

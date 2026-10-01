@@ -61,7 +61,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           push: true
           provenance: false
-          tags: bochaco/formicaio-gh:build-${{ matrix.suffix }}-${{ github.run_id }}
+          tags: ${{ vars.DOCKERHUB_USERNAME }}/formicaio-gh:build-${{ matrix.suffix }}-${{ github.run_id }}
           cache-from: type=gha,scope=${{ matrix.suffix }}
           cache-to: type=gha,mode=max,scope=${{ matrix.suffix }}
 
@@ -82,5 +82,5 @@ jobs:
         run: |
           docker buildx imagetools create \
             -t ${{ vars.DOCKERHUB_USERNAME }}/formicaio:latest \
-            bochaco/formicaio-gh:build-amd64-${{ github.run_id }} \
-            bochaco/formicaio-gh:build-arm64-${{ github.run_id }}
+            ${{ vars.DOCKERHUB_USERNAME }}/formicaio-gh:build-amd64-${{ github.run_id }} \
+            ${{ vars.DOCKERHUB_USERNAME }}/formicaio-gh:build-arm64-${{ github.run_id }}

@@ -59,20 +59,42 @@ pub async fn check_node_bin_version(node_manager: &NodeManager, app_ctx: &AppCon
             logging::error!(
                 "[ERROR][BgTask] Failed to download node binary version {latest_version}: {err:?}"
             );
+            return;
         }
+
+        // nodes are upgraded to the master binary actually installed, which may not be the
+        // latest version published (e.g. when a custom binary download URL is set)
+        let Some(installed_version) = app_ctx.latest_bin_version.read().await.clone() else {
+            return;
+        };
 
         let auto_upgrade = app_ctx.db_client.get_settings().await.nodes_auto_upgrade;
         logging::log!("[BgTask] Nodes auto-upgrading setting enabled?: {auto_upgrade}");
 
         if auto_upgrade {
-            match app_ctx
+            let outdated_nodes = match app_ctx
                 .db_client
-                .get_outdated_nodes_list(&latest_version)
+                .get_outdated_nodes_list(&installed_version)
                 .await
             {
+                Ok(mut nodes) if !nodes.is_empty() => {
+                    // don't downgrade nodes running a newer binary than the installed one
+                    let nodes_info = app_ctx.db_client.get_nodes_list().await;
+                    nodes.retain(|node_id| {
+                        nodes_info
+                            .get(node_id)
+                            .and_then(|info| info.bin_version.as_deref())
+                            .and_then(|v| Version::parse(v).ok())
+                            .is_none_or(|v| v < installed_version)
+                    });
+                    Ok(nodes)
+                }
+                other => other,
+            };
+            match outdated_nodes {
                 Ok(nodes) if !nodes.is_empty() => {
                     logging::log!(
-                        "[BgTask] Creating batch of {} nodes to auto-upgrade node binary to v{latest_version} ...",
+                        "[BgTask] Creating batch of {} nodes to auto-upgrade node binary to v{installed_version} ...",
                         nodes.len()
                     );
 
@@ -95,7 +117,7 @@ pub async fn check_node_bin_version(node_manager: &NodeManager, app_ctx: &AppCon
                     }
                 }
                 Ok(_) => logging::log!(
-                    "[BgTask] No node instances are pending auto-upgrade to node binary version v{latest_version}."
+                    "[BgTask] No node instances are pending auto-upgrade to node binary version v{installed_version}."
                 ),
                 Err(err) => {
                     logging::error!(
@@ -110,7 +132,13 @@ pub async fn check_node_bin_version(node_manager: &NodeManager, app_ctx: &AppCon
 // Query crates.io to find out latest version available of the node
 async fn latest_version_available() -> Option<Version> {
     let url = "https://crates.io/api/v1/crates/ant-node".to_string();
-    let client = reqwest::Client::new();
+    let Ok(client) = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(30))
+        .build()
+    else {
+        return None;
+    };
     const MY_USER_AGENT: &str = "formicaio (https://github.com/bochaco/formicaio)";
 
     let response = match client
@@ -205,6 +233,8 @@ pub async fn update_nodes_info(
                 .write()
                 .await
                 .clear_node_cache(&node_info.node_id);
+            // re-evaluated on each cycle, failing to read metrics will set it again
+            node_info.is_status_unknown = false;
 
             match metrics_mode {
                 MetricsMode::System => {

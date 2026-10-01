@@ -4,6 +4,8 @@ mod tool_executor;
 pub use llm_client::{LlmClient, LlmMessage, OpenAiCompatClient, StreamEvent, ToolDefinition};
 pub use tool_executor::{ToolExecutor, summarize_result};
 
+use tool_executor::{AUTONOMOUS_TOOLS, READ_ONLY_TOOLS, json_error};
+
 use crate::{
     app_context::AppContext,
     node_mgr::NodeManager,
@@ -30,6 +32,13 @@ const MAX_SESSIONS: usize = 20;
 /// Maximum number of (role, content) pairs stored per session.
 /// Older entries are trimmed when this limit is exceeded.
 const MAX_MESSAGES_PER_SESSION: usize = 100;
+
+/// LLM rounds allowed per autonomous monitoring cycle on top of the max actions setting,
+/// since read-only tool calls don't count as actions.
+const MAX_EXTRA_ROUNDS_PER_CYCLE: usize = 10;
+
+/// Lower bound for the autonomous check period; `interval` panics on a zero period.
+const MIN_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
 // Prompt sent on every message sent to the LLM
 const SYSTEM_PROMPT: &str = "You are the Formicaio AI Agent, an expert assistant for managing \
@@ -388,7 +397,9 @@ pub async fn process_chat_turn(
 
 pub async fn run_autonomous_loop(app_ctx: AppContext, node_manager: NodeManager) {
     let settings = app_ctx.agent_ctx.settings.read().await.clone();
-    let mut check_interval = interval(Duration::from_secs(settings.autonomous_check_interval_secs));
+    let mut check_interval = interval(
+        Duration::from_secs(settings.autonomous_check_interval_secs).max(MIN_CHECK_INTERVAL),
+    );
     let mut cmds_rx = app_ctx.agent_ctx.cmds_tx.subscribe();
 
     loop {
@@ -410,7 +421,8 @@ pub async fn run_autonomous_loop(app_ctx: AppContext, node_manager: NodeManager)
                     Ok(AgentCmd::SettingsChanged(new_settings)) => {
                         let new_interval = Duration::from_secs(
                             new_settings.autonomous_check_interval_secs,
-                        );
+                        )
+                        .max(MIN_CHECK_INTERVAL);
                         *app_ctx.agent_ctx.settings.write().await = *new_settings;
                         check_interval = interval(new_interval);
                         logging::log!("[Agent] Settings updated, interval changed to {new_interval:?}");
@@ -442,7 +454,9 @@ async fn run_monitoring_cycle(app_ctx: &AppContext, node_manager: &NodeManager) 
     ];
 
     let max_actions = settings.autonomous_max_actions_per_cycle as usize;
+    let max_rounds = max_actions.saturating_add(MAX_EXTRA_ROUNDS_PER_CYCLE);
     let mut actions_taken: usize = 0;
+    let mut rounds: usize = 0;
     let mut current_messages = messages;
 
     loop {
@@ -457,6 +471,11 @@ async fn run_monitoring_cycle(app_ctx: &AppContext, node_manager: &NodeManager) 
                 .await;
             break;
         }
+        if rounds >= max_rounds {
+            logging::log!("[Agent] Max LLM rounds per cycle ({max_rounds}) reached.");
+            break;
+        }
+        rounds += 1;
 
         let stream = match llm.chat_stream(current_messages.clone(), &tool_defs).await {
             Ok(s) => s,
@@ -542,15 +561,28 @@ async fn run_monitoring_cycle(app_ctx: &AppContext, node_manager: &NodeManager) 
         });
 
         for (_, id, name, args) in &pending {
-            let fake_call = llm_client::LlmToolCall {
-                id: id.clone(),
-                r#type: "function".to_string(),
-                function: llm_client::LlmFunctionCall {
-                    name: name.clone(),
-                    arguments: args.clone(),
-                },
+            let is_action = !READ_ONLY_TOOLS.contains(&name.as_str());
+            let result = if !AUTONOMOUS_TOOLS.contains(&name.as_str()) {
+                logging::warn!("[Agent] Tool '{name}' refused: not allowed in autonomous mode");
+                json_error(&format!("Tool '{name}' is not available in autonomous mode"))
+            } else if is_action && actions_taken >= max_actions {
+                json_error(&format!(
+                    "Max actions per cycle ({max_actions}) reached, '{name}' was not executed"
+                ))
+            } else {
+                if is_action {
+                    actions_taken += 1;
+                }
+                let fake_call = llm_client::LlmToolCall {
+                    id: id.clone(),
+                    r#type: "function".to_string(),
+                    function: llm_client::LlmFunctionCall {
+                        name: name.clone(),
+                        arguments: args.clone(),
+                    },
+                };
+                executor.execute(&fake_call).await
             };
-            let result = executor.execute(&fake_call).await;
 
             logging::log!(
                 "[Agent] Autonomous action '{name}': {}",
@@ -565,7 +597,6 @@ async fn run_monitoring_cycle(app_ctx: &AppContext, node_manager: &NodeManager) 
                 .await;
 
             current_messages.push(LlmMessage::tool_result(id, &result));
-            actions_taken += 1;
         }
     }
 

@@ -398,9 +398,8 @@ fn agent_event_notification(event_type: &AgentEventType, description: &str) -> S
 fn truncate_notification(prefix: &str, text: &str, max_chars: usize) -> String {
     let text = text.trim();
     let text = text.split('\n').next().unwrap_or(text);
-    if text.len() > max_chars {
-        format!("{prefix} {}…", &text[..max_chars].trim_end())
-    } else {
-        format!("{prefix} {text}")
+    match text.char_indices().nth(max_chars) {
+        Some((end, _)) => format!("{prefix} {}…", text[..end].trim_end()),
+        None => format!("{prefix} {text}"),
     }
 }

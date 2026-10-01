@@ -468,12 +468,13 @@ impl CliCommands {
                 if opts.count > 1 {
                     // TODO: use some crate which performs this serialisation
                     let body = format!(
-                        "batch_type[Create][node_opts][ipv4_only]={}&batch_type[Create][node_opts][port]={}&batch_type[Create][node_opts][metrics_port]={}&batch_type[Create][node_opts][rewards_addr]={}&batch_type[Create][node_opts][node_logs]={}&batch_type[Create][node_opts][log_level]=info&batch_type[Create][node_opts][auto_start]={}&batch_type[Create][node_opts][data_dir_path]={}&batch_type[Create][count]={}&interval_secs={}",
+                        "batch_type[Create][node_opts][ipv4_only]={}&batch_type[Create][node_opts][port]={}&batch_type[Create][node_opts][metrics_port]={}&batch_type[Create][node_opts][rewards_addr]={}&batch_type[Create][node_opts][node_logs]={}&batch_type[Create][node_opts][log_level]={:?}&batch_type[Create][node_opts][auto_start]={}&batch_type[Create][node_opts][data_dir_path]={}&batch_type[Create][count]={}&interval_secs={}",
                         ipv4_only,
                         opts.port,
                         opts.metrics_port,
                         opts.rewards_addr,
                         true,
+                        LogLevel::default(),
                         opts.auto_start,
                         form_urlencoded::byte_serialize(
                             opts.data_dir_path.display().to_string().as_bytes()
@@ -489,12 +490,13 @@ impl CliCommands {
                 } else {
                     // TODO: use some crate which performs this serialisation
                     let body = format!(
-                        "node_opts[ipv4_only]={}&node_opts[port]={}&node_opts[metrics_port]={}&node_opts[rewards_addr]={}&node_opts[node_logs]={}&node_opts[log_level]=info&node_opts[auto_start]={}&node_opts[data_dir_path]={}",
+                        "node_opts[ipv4_only]={}&node_opts[port]={}&node_opts[metrics_port]={}&node_opts[rewards_addr]={}&node_opts[node_logs]={}&node_opts[log_level]={:?}&node_opts[auto_start]={}&node_opts[data_dir_path]={}",
                         ipv4_only,
                         opts.port,
                         opts.metrics_port,
                         opts.rewards_addr,
                         true,
+                        LogLevel::default(),
                         opts.auto_start,
                         form_urlencoded::byte_serialize(
                             opts.data_dir_path.display().to_string().as_bytes()

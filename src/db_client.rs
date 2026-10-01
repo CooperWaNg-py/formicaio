@@ -193,6 +193,7 @@ struct CachedEarnings {
     address: String,
     amount: String,
     block_number: i64,
+    log_index: Option<i64>,
     timestamp: i64,
 }
 
@@ -547,6 +548,8 @@ impl DbClient {
         if update_status {
             updates.push("status=?");
             params.push(Some(json!(info.status).to_string()));
+            updates.push("is_status_unknown=?");
+            params.push(Some(if info.is_status_unknown { "1" } else { "0" }.to_string()));
         }
 
         if info.status_changed > 0 {
@@ -607,9 +610,19 @@ impl DbClient {
         match query.execute(&*db_lock).await {
             Ok(result) => {
                 if result.rows_affected() == 0 {
-                    // insert a new record then
-                    drop(db_lock);
-                    self.insert_node_metadata(info).await;
+                    // Docker containers are the source of truth there, so adopt any
+                    // container missing from the DB. Native nodes only exist through
+                    // their DB row, so a missing row means it was deleted meanwhile.
+                    #[cfg(not(feature = "native"))]
+                    {
+                        drop(db_lock);
+                        self.insert_node_metadata(info).await;
+                    }
+                    #[cfg(feature = "native")]
+                    logging::warn!(
+                        "[WARN][DB] Node {} not found in DB while updating its metadata, skipping.",
+                        info.node_id
+                    );
                 }
             }
             Err(err) => {
@@ -860,21 +873,25 @@ impl DbClient {
         }
     }
 
-    // Store earnings (reward payment) for an address with block number and timestamp
+    // Store earnings (reward payment) for an address with block number, log index and timestamp.
+    // A zero amount with no log index records that all blocks up to block_number were synced.
     pub async fn store_earnings(
         &self,
         address: &Address,
         amount: U256,
         block_number: u64,
+        log_index: Option<u64>,
         timestamp: i64,
     ) {
         let db_lock = self.db.lock().await;
         match sqlx::query(
-            "INSERT INTO earnings (address, amount, block_number, timestamp) VALUES (?, ?, ?, ?)",
+            "INSERT OR IGNORE INTO earnings (address, amount, block_number, log_index, timestamp) \
+            VALUES (?, ?, ?, ?, ?)",
         )
         .bind(address.to_string())
         .bind(amount.to_string())
         .bind(block_number as i64)
+        .bind(log_index.map(|i| i as i64))
         .bind(timestamp)
         .execute(&*db_lock)
         .await
@@ -886,7 +903,8 @@ impl DbClient {
         }
     }
 
-    // Retrieve earnings for an address, filtered by minimum block number
+    // Retrieve earnings for an address, filtered by minimum block number, along with
+    // the last block fully synced for it (highest zero-amount sync marker).
     pub async fn get_earnings(
         &self,
         address: &Address,
@@ -901,7 +919,6 @@ impl DbClient {
             .fetch_all(&*db_lock)
             .await;
 
-        // compute cached min/max block numbers
         let mut max_cached: Option<u64> = None;
 
         let payments = match res {
@@ -915,12 +932,12 @@ impl DbClient {
                 .into_iter()
                 .filter_map(|e| {
                     let block_number = e.block_number as u64;
-                    if block_number > 0 {
-                        max_cached = Some(max_cached.map_or(block_number, |m| m.max(block_number)));
-                    }
-
                     let amount = U256::from_str(&e.amount).unwrap_or(U256::ZERO);
                     if amount == U256::ZERO {
+                        if block_number > 0 {
+                            max_cached =
+                                Some(max_cached.map_or(block_number, |m| m.max(block_number)));
+                        }
                         return None;
                     }
                     let timestamp = Utc
@@ -932,6 +949,7 @@ impl DbClient {
                         timestamp,
                         amount,
                         block_number,
+                        log_index: e.log_index.map(|i| i as u64),
                     })
                 })
                 .collect(),

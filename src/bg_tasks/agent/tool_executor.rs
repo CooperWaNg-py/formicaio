@@ -20,6 +20,13 @@ impl From<McpTool> for ToolDefinition {
     }
 }
 
+/// Tools the autonomous monitoring loop may call: read-only and safe-start only.
+/// Destructive operations (delete, recycle, upgrade, create, stop) are excluded.
+pub const AUTONOMOUS_TOOLS: &[&str] = &["fetch_stats", "nodes_instances", "start_node_instance"];
+
+/// Tools which only read state, i.e. which don't count as autonomous actions.
+pub const READ_ONLY_TOOLS: &[&str] = &["fetch_stats", "nodes_instances"];
+
 /// Dispatches LLM tool calls directly to the existing `mcp_tools` functions,
 /// avoiding any HTTP round-trip through the external MCP server.
 pub struct ToolExecutor {
@@ -142,18 +149,11 @@ impl ToolExecutor {
             .collect()
     }
 
-    /// Restricted tool set for the autonomous monitoring loop.
-    /// Only read-only and safe-start tools are allowed — destructive operations
-    /// (delete, recycle, upgrade, create) must not be available to the autonomous agent.
+    /// Restricted tool set for the autonomous monitoring loop, see `AUTONOMOUS_TOOLS`.
     pub fn autonomous_tool_definitions() -> Vec<ToolDefinition> {
         Self::tool_definitions()
             .into_iter()
-            .filter(|t| {
-                matches!(
-                    t.function.name.as_str(),
-                    "fetch_stats" | "nodes_instances" | "start_node_instance"
-                )
-            })
+            .filter(|t| AUTONOMOUS_TOOLS.contains(&t.function.name.as_str()))
             .collect()
     }
 }
@@ -296,7 +296,7 @@ fn parse_u16_arg(args: &Value, name: &str) -> Result<u16, String> {
     u16::try_from(value).map_err(|_| format!("{name} must be <= {}", u16::MAX))
 }
 
-fn json_error(msg: &str) -> String {
+pub(super) fn json_error(msg: &str) -> String {
     serde_json::to_string(&json!({ "error": msg }))
         .unwrap_or_else(|_| "{\"error\":\"internal serialization error\"}".to_string())
 }

@@ -212,7 +212,10 @@ To upgrade Formicaio:
 
 Formicaio is available on:
 - Official UmbrelOS app store: [https://apps.umbrel.com](https://apps.umbrel.com)
-- Through the [Formicaio community app store](https://github.com/bochaco/formicaio-app-store). 
+- Through the [Formicaio community app store](https://github.com/bochaco/formicaio-app-store).
+- Through the [Formicaio Community app store](https://github.com/CooperWaNg-py/formicaio-app-store), built from this fork with additional fixes.
+
+> **Nodes exit with "exit status: 2"?** Formicaio 0.8.5 and earlier (the official app store currently ships 0.8.4) pass `--bootstrap-cache-dir` to `ant-node`, an argument current `ant-node` releases reject. Every node start or restart then fails with exit status 2. Install a build based on 0.8.6 or later, such as either community app store.
 
 #### Installation via UmbrelOS Official App Store
 
@@ -225,9 +228,9 @@ To install Formicaio using the UmbrelOS official app store:
 
 Once installed, you can access Formicaio directly from your UmbrelOS dashboard.
 
-#### Install via Formicaio community app store:
+#### Install via a Formicaio community app store:
 
-1. Add the GitHub URL: `https://github.com/bochaco/formicaio-app-store`
+1. Add the GitHub URL: `https://github.com/bochaco/formicaio-app-store`, or `https://github.com/CooperWaNg-py/formicaio-app-store` for this fork's build
 2. Install through the UmbrelOS user interface
 
 **Demo**: [Installation Video](https://user-images.githubusercontent.com/10330103/197889452-e5cd7e96-3233-4a09-b475-94b754adc7a3.mp4)

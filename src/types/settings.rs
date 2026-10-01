@@ -15,9 +15,10 @@ pub enum MetricsMode {
 impl MetricsMode {
     pub fn from_db(v: i64) -> Self {
         match v {
+            0 => Self::Http,
             1 => Self::System,
             2 => Self::Disabled,
-            _ => Self::Http,
+            _ => Self::default(),
         }
     }
 

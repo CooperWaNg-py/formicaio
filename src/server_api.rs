@@ -17,10 +17,10 @@ mod ssr_imports_and_defs {
         bg_tasks::{
             BgTasksCmds,
             agent::{LlmClient, OpenAiCompatClient, process_chat_turn},
-            prepare_node_action_batch,
+            prepare_node_action_batch, unlock_batched_nodes,
         },
-        types::{MetricsMode, WidgetStat},
-        views::truncated_balance_str,
+        types::{BatchStatus, MetricsMode, WidgetStat},
+        views::{format_disk_usage, truncated_balance_str},
     };
     pub use bytes::Bytes;
     pub use futures_util::StreamExt;
@@ -68,8 +68,8 @@ pub async fn fetch_stats_widget() -> Result<WidgetFourStats, ServerFnError> {
                 subtext: "".to_string(),
             },
             WidgetStat {
-                title: "Network size".to_string(),
-                text: stats.estimated_net_size.to_string(),
+                title: "Disk used".to_string(),
+                text: format_disk_usage(stats.used_disk_space),
                 subtext: "".to_string(),
             },
         ],
@@ -206,6 +206,38 @@ pub async fn get_settings() -> Result<super::types::AppSettings, ServerFnError> 
 /// Update the settings
 #[server(name = UpdateSettings, prefix = "/api", endpoint = "/settings/set")]
 pub async fn update_settings(settings: super::types::AppSettings) -> Result<(), ServerFnError> {
+    // zero values would make the periodic tasks panic (and crash-loop at boot once persisted)
+    let zero_field = [
+        (
+            "Node binary version polling frequency",
+            settings.node_bin_version_polling_freq.is_zero(),
+        ),
+        (
+            "Nodes metrics polling frequency",
+            settings.nodes_metrics_polling_freq.is_zero(),
+        ),
+        (
+            "Disks usage check frequency",
+            settings.disks_usage_check_freq.is_zero(),
+        ),
+        (
+            "Rewards balances retrieval frequency",
+            settings.rewards_balances_retrieval_freq.is_zero(),
+        ),
+        (
+            "Autonomous check interval",
+            settings.autonomous_check_interval_secs == 0,
+        ),
+        ("Node list page size", settings.node_list_page_size == 0),
+    ]
+    .into_iter()
+    .find_map(|(name, is_zero)| is_zero.then_some(name));
+    if let Some(name) = zero_field {
+        return Err(ServerFnError::new(format!(
+            "Invalid settings: {name} must be greater than zero"
+        )));
+    }
+
     let context = expect_context::<ServerGlobalState>();
     let old_settings = context.app_ctx.db_client.get_settings().await;
     if old_settings.node_bin_download_url != settings.node_bin_download_url {
@@ -298,12 +330,28 @@ pub async fn cancel_batch(batch_id: u16) -> Result<(), ServerFnError> {
 
     let mut guard = context.app_ctx.node_action_batches.write().await;
     if let Some(index) = guard.1.iter().position(|b| b.id == batch_id) {
-        if guard.1[index].status.is_failed() {
-            // failed batch — just remove it (dismiss)
-            guard.1.remove(index);
-        } else {
-            // still running/scheduled — signal the runner to cancel
-            guard.0.send(batch_id)?;
+        match guard.1[index].status {
+            BatchStatus::Failed(_) => {
+                // failed batch — just remove it (dismiss)
+                guard.1.remove(index);
+            }
+            BatchStatus::Scheduled => {
+                // not picked up by the runner yet — dequeue it and release its nodes
+                let batch = guard.1.remove(index);
+                drop(guard);
+                unlock_batched_nodes(&context.app_ctx, &batch.batch_type).await;
+            }
+            BatchStatus::InProgress => {
+                // signal the runner to cancel; with no runner left, just drop the entry
+                if guard.0.send(batch_id).is_err() {
+                    guard.1.remove(index);
+                }
+            }
+            BatchStatus::InProgressWithFailures(..) => {
+                // a runner may still be executing it, or it may be orphaned (no receiver)
+                let _ = guard.0.send(batch_id);
+                guard.1.remove(index);
+            }
         }
     }
     Ok(())

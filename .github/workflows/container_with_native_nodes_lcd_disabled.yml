@@ -59,7 +59,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           push: true
           provenance: false
-          tags: bochaco/formicaio-gh:build-native-lcd-disabled-${{ matrix.suffix }}-${{ github.run_id }}
+          tags: ${{ vars.DOCKERHUB_USERNAME }}/formicaio-gh:build-native-lcd-disabled-${{ matrix.suffix }}-${{ github.run_id }}
           cache-from: type=gha,scope=native-lcd-disabled-${{ matrix.suffix }}
           cache-to: type=gha,mode=max,scope=native-lcd-disabled-${{ matrix.suffix }}
           build-args: |
@@ -82,5 +82,5 @@ jobs:
         run: |
           docker buildx imagetools create \
             -t ${{ vars.DOCKERHUB_USERNAME }}/formicaio:${{ needs.extract_version.outputs.version }}-native-lcd-disabled \
-            bochaco/formicaio-gh:build-native-lcd-disabled-amd64-${{ github.run_id }} \
-            bochaco/formicaio-gh:build-native-lcd-disabled-arm64-${{ github.run_id }}
+            ${{ vars.DOCKERHUB_USERNAME }}/formicaio-gh:build-native-lcd-disabled-amd64-${{ github.run_id }} \
+            ${{ vars.DOCKERHUB_USERNAME }}/formicaio-gh:build-native-lcd-disabled-arm64-${{ github.run_id }}

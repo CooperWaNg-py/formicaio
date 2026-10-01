@@ -174,13 +174,7 @@ impl NodesSortStrategy {
 
     fn cmp_opts(a: Option<f64>, b: Option<f64>) -> Ordering {
         match (a, b) {
-            (Some(a), Some(b)) => {
-                if a > b {
-                    Ordering::Greater
-                } else {
-                    Ordering::Less
-                }
-            }
+            (Some(a), Some(b)) => a.total_cmp(&b),
             (Some(_), None) => Ordering::Greater,
             (None, Some(_)) => Ordering::Less,
             (None, None) => Ordering::Equal,
@@ -191,6 +185,26 @@ impl NodesSortStrategy {
         Self::cmp_opts(a.map(|v| v as f64), b.map(|v| v as f64))
     }
 
+    // Numeric dotted-version comparison (e.g. "0.10.0" > "0.9.0"), falling back to plain
+    // string comparison for versions that can't be parsed that way.
+    fn cmp_bin_versions(a: Option<&str>, b: Option<&str>) -> Ordering {
+        fn numeric(v: &str) -> Option<impl Iterator<Item = u64> + '_> {
+            let v = v.strip_prefix('v').unwrap_or(v);
+            let core = v.split(['-', '+']).next().unwrap_or(v);
+            let valid = !core.is_empty() && core.split('.').all(|p| p.parse::<u64>().is_ok());
+            valid.then(|| core.split('.').map(|p| p.parse::<u64>().unwrap_or_default()))
+        }
+        match (a, b) {
+            (Some(a), Some(b)) => match (numeric(a), numeric(b)) {
+                (Some(na), Some(nb)) => na.cmp(nb).then_with(|| a.cmp(b)),
+                (Some(_), None) => Ordering::Greater,
+                (None, Some(_)) => Ordering::Less,
+                (None, None) => a.cmp(b),
+            },
+            (a, b) => a.cmp(&b),
+        }
+    }
+
     pub fn cmp(&self, a: &NodeInstanceInfo, b: &NodeInstanceInfo) -> Ordering {
         match (self.field, self.is_descending) {
             (NodeSortField::NodeId, false) => a.node_id.cmp(&b.node_id),
@@ -199,8 +213,12 @@ impl NodesSortStrategy {
             (NodeSortField::Status, true) => b.status_summary().cmp(&a.status_summary()),
             (NodeSortField::CreationDate, false) => a.created.cmp(&b.created),
             (NodeSortField::CreationDate, true) => b.created.cmp(&a.created),
-            (NodeSortField::BinaryVersion, false) => a.bin_version.cmp(&b.bin_version),
-            (NodeSortField::BinaryVersion, true) => b.bin_version.cmp(&a.bin_version),
+            (NodeSortField::BinaryVersion, false) => {
+                Self::cmp_bin_versions(a.bin_version.as_deref(), b.bin_version.as_deref())
+            }
+            (NodeSortField::BinaryVersion, true) => {
+                Self::cmp_bin_versions(b.bin_version.as_deref(), a.bin_version.as_deref())
+            }
             (NodeSortField::PortNumber, false) => a.port.cmp(&b.port),
             (NodeSortField::PortNumber, true) => b.port.cmp(&a.port),
             (NodeSortField::Rewards, false) => a.rewards.cmp(&b.rewards),
@@ -229,7 +247,8 @@ impl NodesSortStrategy {
             |a, b| match (a.1.try_read_untracked(), b.1.try_read_untracked()) {
                 (Some(a), Some(b)) => self.cmp(&a, &b),
                 (Some(_), None) => Ordering::Greater,
-                _ => Ordering::Less,
+                (None, Some(_)) => Ordering::Less,
+                (None, None) => Ordering::Equal,
             },
         )
     }

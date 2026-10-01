@@ -51,6 +51,14 @@ const NODE_LOG_FILENAME_PREFIX: &str = "ant-node.";
 const ANT_NODE_GITHUB_REPO: &str = "WithAutonomi/ant-node";
 const GITHUB_API_URL: &str = "https://api.github.com";
 const DEFAULT_BIN_DOWNLOAD_BASE_URL: &str = "https://github.com/WithAutonomi/ant-node";
+// Bootstrap peers config file shipped in the node binary release archive, and env var
+// used to point ant-node to it, otherwise nodes cannot join the network.
+const BOOTSTRAP_PEERS_FILENAME: &str = "bootstrap_peers.toml";
+const BOOTSTRAP_PEERS_PATH_ENV: &str = "ANT_BOOTSTRAP_PEERS_PATH";
+// Timeouts used when fetching release info and downloading the node binary.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const HTTP_API_TIMEOUT: Duration = Duration::from_secs(30);
+const BIN_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 #[derive(Debug, Error)]
 pub enum NativeNodesError {
@@ -107,28 +115,41 @@ fn get_platform_archive_name() -> Result<String, NativeNodesError> {
     Ok(name.to_string())
 }
 
-// Extract NODE_BIN_NAME from a .tar.gz or .zip archive to the destination path
+// Extract NODE_BIN_NAME from a .tar.gz or .zip archive to the destination path,
+// as well as the bootstrap peers config file, if present in the archive.
 fn extract_binary_from_archive(
     archive_path: &Path,
     bin_name: &str,
     dest_path: &Path,
+    bootstrap_peers_dest_path: &Path,
 ) -> Result<(), NativeNodesError> {
     let archive_str = archive_path.to_string_lossy();
+    let mut bin_found = false;
     if archive_str.ends_with(".tar.gz") {
         let file = std::fs::File::open(archive_path)?;
         let gz = GzDecoder::new(file);
         let mut archive = tar::Archive::new(gz);
         for entry in archive.entries()? {
             let mut entry = entry?;
-            let path = entry.path()?;
-            if path.file_name().is_some_and(|n| n == bin_name) {
-                entry.unpack(dest_path)?;
-                return Ok(());
+            let file_name = entry.path()?.file_name().map(|n| n.to_os_string());
+            match file_name {
+                Some(n) if n.as_os_str() == bin_name => {
+                    entry.unpack(dest_path)?;
+                    bin_found = true;
+                }
+                Some(n) if n.as_os_str() == BOOTSTRAP_PEERS_FILENAME => {
+                    entry.unpack(bootstrap_peers_dest_path)?;
+                }
+                _ => {}
             }
         }
-        Err(NativeNodesError::NodeBinDownloadError(format!(
-            "Binary '{bin_name}' not found in archive"
-        )))
+        if bin_found {
+            Ok(())
+        } else {
+            Err(NativeNodesError::NodeBinDownloadError(format!(
+                "Binary '{bin_name}' not found in archive"
+            )))
+        }
     } else {
         // .zip (Windows)
         let file = std::fs::File::open(archive_path)?;
@@ -138,15 +159,24 @@ fn extract_binary_from_archive(
             let mut entry = zip
                 .by_index(i)
                 .map_err(|e| NativeNodesError::NodeBinDownloadError(e.to_string()))?;
-            if entry.name().ends_with(bin_name) {
-                let mut out = std::fs::File::create(dest_path)?;
-                std::io::copy(&mut entry, &mut out)?;
-                return Ok(());
-            }
+            let out_path = if entry.name().ends_with(bin_name) {
+                bin_found = true;
+                dest_path
+            } else if entry.name().ends_with(BOOTSTRAP_PEERS_FILENAME) {
+                bootstrap_peers_dest_path
+            } else {
+                continue;
+            };
+            let mut out = std::fs::File::create(out_path)?;
+            std::io::copy(&mut entry, &mut out)?;
         }
-        Err(NativeNodesError::NodeBinDownloadError(format!(
-            "Binary '{bin_name}' not found in zip archive"
-        )))
+        if bin_found {
+            Ok(())
+        } else {
+            Err(NativeNodesError::NodeBinDownloadError(format!(
+                "Binary '{bin_name}' not found in zip archive"
+            )))
+        }
     }
 }
 
@@ -241,10 +271,10 @@ pub struct NativeNodes {
 }
 
 impl NativeNodes {
-    pub async fn new(
+    pub async fn new<'a>(
         node_status_locked: ImmutableNodeStatus,
         data_dir_path: Option<PathBuf>,
-        initial_pids: impl Iterator<Item = (NodeId, u32)>,
+        initial_nodes: impl Iterator<Item = &'a NodeInstanceInfo>,
     ) -> Result<Self, NativeNodesError> {
         if !sysinfo::IS_SUPPORTED_SYSTEM {
             panic!(
@@ -265,26 +295,48 @@ impl NativeNodes {
         logging::log!("[NodeMgr] Node manager initialized with root directory: {root_dir:?}");
         create_dir_all(&root_dir).await?;
 
-        let system = Arc::new(RwLock::new(System::new()));
-        let mut nodes = HashMap::new();
-        let mut lmdb_envs = HashMap::new();
-        for (node_id, pid) in initial_pids {
-            let node_dir = root_dir
-                .join(DEFAULT_NODE_DATA_FOLDER)
-                .join(node_id.to_string());
-            if let Some(env) = open_lmdb_env_readonly(&node_dir) {
-                lmdb_envs.insert(node_id.clone(), env);
+        let native_nodes = Self {
+            root_dir,
+            system: Arc::new(RwLock::new(System::new())),
+            nodes: Arc::new(RwLock::new(HashMap::new())),
+            node_status_locked,
+            lmdb_envs: Arc::new(RwLock::new(HashMap::new())),
+        };
+
+        let initial_nodes = initial_nodes
+            .filter_map(|info| info.pid.map(|pid| (info, Pid::from_u32(pid))))
+            .collect::<Vec<_>>();
+        let pids = initial_nodes.iter().map(|(_, pid)| *pid).collect::<Vec<_>>();
+        {
+            let mut sys = native_nodes.system.write().await;
+            sys.refresh_processes_specifics(
+                ProcessesToUpdate::Some(&pids),
+                true,
+                ProcessRefreshKind::nothing().with_exe(UpdateKind::OnlyIfNotSet),
+            );
+            let mut nodes = native_nodes.nodes.write().await;
+            let mut lmdb_envs = native_nodes.lmdb_envs.write().await;
+            for (info, pid) in initial_nodes {
+                let node_dir = native_nodes.get_node_data_dir(info, true);
+                // PIDs stored in the DB may have been reused by unrelated processes
+                // (e.g. after a restart), only track those still running this node's binary.
+                let Some(process) = sys.process(pid) else {
+                    continue;
+                };
+                if process
+                    .exe()
+                    .is_some_and(|exe| exe != native_nodes.resolved_node_bin_path(info))
+                {
+                    continue;
+                }
+                if let Some(env) = open_lmdb_env_readonly(&node_dir) {
+                    lmdb_envs.insert(info.node_id.clone(), env);
+                }
+                nodes.insert(info.node_id.clone(), NodeProcess::ProcessFound(pid));
             }
-            nodes.insert(node_id, NodeProcess::ProcessFound(Pid::from_u32(pid)));
         }
 
-        Ok(Self {
-            root_dir,
-            system,
-            nodes: Arc::new(RwLock::new(nodes)),
-            node_status_locked,
-            lmdb_envs: Arc::new(RwLock::new(lmdb_envs)),
-        })
+        Ok(native_nodes)
     }
 
     pub fn has_master_bin(&self) -> bool {
@@ -406,6 +458,10 @@ impl NativeNodes {
         command.stdout(Stdio::null());
         command.stderr(Stdio::null());
         command.current_dir(&self.root_dir);
+        let bootstrap_peers_path = self.root_dir.join(BOOTSTRAP_PEERS_FILENAME);
+        if bootstrap_peers_path.exists() {
+            command.env(BOOTSTRAP_PEERS_PATH_ENV, bootstrap_peers_path);
+        }
 
         logging::log!("[NodeMgr] Spawning new node process {node_id} with command: {command:?}");
         // Run the node
@@ -451,8 +507,10 @@ impl NativeNodes {
         mut nodes_info: HashMap<NodeId, NodeInstanceInfo>,
         read_lmdb: bool,
     ) -> Result<(Vec<NodeInstanceInfo>, Vec<(NodeId, u32, String, String)>), NativeNodesError> {
-        // first update processes information of our `System` struct
-        let sys = {
+        // first update processes information of our `System` struct, and take a snapshot
+        // of the node processes so the lock is released before any further (async) work,
+        // e.g. killing processes also needs to acquire it.
+        let (num_cpus, processes) = {
             let mut sys = self.system.write().await;
             sys.refresh_processes_specifics(
                 ProcessesToUpdate::All,
@@ -462,21 +520,35 @@ impl NativeNodes {
                     .with_cpu()
                     .with_memory(),
             );
-            sys
+            let num_cpus = sys.cpus().len().max(1) as f64;
+            let processes = sys
+                .processes_by_exact_name(NODE_BIN_NAME.as_ref())
+                // filter out threads
+                .filter(|p| p.thread_kind().is_none())
+                .map(|p| {
+                    (
+                        p.pid(),
+                        p.exe().map(Path::to_path_buf),
+                        p.status(),
+                        p.memory(),
+                        p.cpu_usage(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (num_cpus, processes)
         };
 
-        let num_cpus = sys.cpus().len().max(1) as f64;
         let mut nodes_list = vec![];
         let mut new_pids = vec![];
 
-        for process in sys
-            .processes_by_exact_name(NODE_BIN_NAME.as_ref())
-            // filter out threads
-            .filter(|p| p.thread_kind().is_none())
-        {
-            let pid = process.pid().as_u32();
+        for (process_pid, exe, process_status, memory, cpu_usage) in processes {
+            let pid = process_pid.as_u32();
+            // PIDs can be reused (e.g. after a restart), so a PID match is only
+            // trusted if the process runs this node's binary.
             let mut info = nodes_info.iter().find_map(|(_, n)| {
-                if n.pid == Some(pid) {
+                if n.pid == Some(pid)
+                    && exe.as_ref().is_none_or(|exe| *exe == self.resolved_node_bin_path(n))
+                {
                     Some(n.clone())
                 } else {
                     None
@@ -484,14 +556,14 @@ impl NativeNodes {
             });
 
             if info.is_none()
-                && let Some(exec_path) = process.exe()
+                && let Some(exec_path) = &exe
             {
                 // There is an active PID not found in our DB/list,
                 // let's try to match it using its execution path
                 info = self
                     .start_tracking_found_process(
                         exec_path,
-                        process.pid(),
+                        process_pid,
                         &nodes_info,
                         &mut new_pids,
                     )
@@ -501,10 +573,10 @@ impl NativeNodes {
             if let Some(mut node_info) = info {
                 let node_id = &node_info.node_id;
                 nodes_info.remove(node_id);
-                if process.status() != ProcessStatus::Zombie {
+                if process_status != ProcessStatus::Zombie {
                     node_info.set_status_active();
-                    node_info.mem_used = Some(process.memory() as f64 / 1_048_576.0);
-                    node_info.cpu_usage = Some(process.cpu_usage() as f64 / num_cpus);
+                    node_info.mem_used = Some(memory as f64 / 1_048_576.0);
+                    node_info.cpu_usage = Some(cpu_usage as f64 / num_cpus);
 
                     if read_lmdb {
                         let count_from = |env: &heed::Env| -> Option<usize> {
@@ -565,7 +637,7 @@ impl NativeNodes {
                     InactiveReason::Exited(status.to_string())
                 } else {
                     logging::warn!(
-                        "[WARN][NodeMgr] Zombie process detected with pid {pid}: {process:?}"
+                        "[WARN][NodeMgr] Zombie process detected with pid {pid}: {exe:?}"
                     );
                     InactiveReason::Exited("zombie".to_string())
                 };
@@ -690,8 +762,7 @@ impl NativeNodes {
         new_pids: &mut Vec<(NodeId, u32, String, String)>,
     ) -> Option<NodeInstanceInfo> {
         for (node_id, node_info) in nodes_info.iter() {
-            let node_path = self.get_node_data_dir(node_info, true).join(NODE_BIN_NAME);
-            if exec_path == node_path {
+            if exec_path == self.resolved_node_bin_path(node_info) {
                 let (bin_version, peer_id) = if let Ok((bin_version, peer_id, _)) =
                     self.get_node_version_and_peer_id(node_info).await
                 {
@@ -703,30 +774,33 @@ impl NativeNodes {
                 // we will consider it only if the pid is different than the one we had for same node_id,
                 // it could be that it was just added to the list in a concurrent operation
                 let new_pid = pid.as_u32();
-                match self.nodes.write().await.entry(node_id.clone()) {
+                let old_node_process = match self.nodes.write().await.entry(node_id.clone()) {
                     Entry::Occupied(mut e) => {
-                        let old_pid = e.get().pid();
-                        if old_pid == new_pid {
+                        if e.get().pid() == new_pid {
                             // it must have been that it was just added in a
                             // concurrent operation, ...let's just ignore this process then
                             return None;
-                        } else {
-                            let old_node_process = e.insert(NodeProcess::ProcessFound(pid));
-                            let status = if let Some(exit_status) =
-                                self.kill_node_process(node_id, old_node_process).await
-                            {
-                                exit_status.to_string()
-                            } else {
-                                "none".to_string()
-                            };
-                            logging::log!(
-                                "[NodeMgr] Process with PID {old_pid} which restarted itself (node id: {node_id}) exited with status: {status}",
-                            );
                         }
+                        Some(e.insert(NodeProcess::ProcessFound(pid)))
                     }
                     Entry::Vacant(e) => {
                         e.insert(NodeProcess::ProcessFound(pid));
+                        None
                     }
+                };
+
+                if let Some(old_node_process) = old_node_process {
+                    let old_pid = old_node_process.pid();
+                    let status = if let Some(exit_status) =
+                        self.kill_node_process(node_id, old_node_process).await
+                    {
+                        exit_status.to_string()
+                    } else {
+                        "none".to_string()
+                    };
+                    logging::log!(
+                        "[NodeMgr] Process with PID {old_pid} which restarted itself (node id: {node_id}) exited with status: {status}",
+                    );
                 }
 
                 logging::log!(
@@ -765,6 +839,17 @@ impl NativeNodes {
                 "[WARN][NodeMgr] Failed to remove node's dir {node_data_dir:?}: {err:?}"
             );
         }
+    }
+
+    // Path of the node's binary as the OS reports it for its running process
+    // (i.e. with symlinks and relative components resolved).
+    fn resolved_node_bin_path(&self, node_info: &NodeInstanceInfo) -> PathBuf {
+        let path = self.get_node_data_dir(node_info, true).join(NODE_BIN_NAME);
+        std::fs::canonicalize(&path).unwrap_or(path)
+    }
+
+    pub async fn is_tracked(&self, node_id: &NodeId) -> bool {
+        self.nodes.read().await.contains_key(node_id)
     }
 
     // Helper to get node data dir based on node-mgr root dir and node custom data dir if set
@@ -943,7 +1028,12 @@ impl NativeNodes {
         version: Option<&Version>,
         bin_download_url: Option<&str>,
     ) -> Result<Version, NativeNodesError> {
-        let client = reqwest::Client::builder().user_agent("formicaio").build()?;
+        let client = reqwest::Client::builder()
+            .user_agent("formicaio")
+            .connect_timeout(HTTP_CONNECT_TIMEOUT)
+            .timeout(BIN_DOWNLOAD_TIMEOUT)
+            .build()?;
+        let bootstrap_peers_path = self.root_dir.join(BOOTSTRAP_PEERS_FILENAME);
 
         // When a custom full URL is provided, download directly without any GitHub interaction.
         if let Some(full_url) = bin_download_url {
@@ -974,7 +1064,12 @@ impl NativeNodes {
             let archive_path = self.root_dir.join(archive_name);
             tokio::fs::write(&archive_path, &archive_bytes).await?;
             let bin_path = self.root_dir.join(NODE_BIN_NAME);
-            if let Err(err) = extract_binary_from_archive(&archive_path, NODE_BIN_NAME, &bin_path) {
+            if let Err(err) = extract_binary_from_archive(
+                &archive_path,
+                NODE_BIN_NAME,
+                &bin_path,
+                &bootstrap_peers_path,
+            ) {
                 logging::error!(
                     "[ERROR][NodeMgr] Failed to extract node binary from archive: {err}"
                 );
@@ -1000,7 +1095,13 @@ impl NativeNodes {
             Some(v) => v.clone(),
             None => {
                 let url = format!("{GITHUB_API_URL}/repos/{ANT_NODE_GITHUB_REPO}/releases/latest");
-                let resp: serde_json::Value = client.get(&url).send().await?.json().await?;
+                let resp: serde_json::Value = client
+                    .get(&url)
+                    .timeout(HTTP_API_TIMEOUT)
+                    .send()
+                    .await?
+                    .json()
+                    .await?;
                 let tag = resp["tag_name"]
                     .as_str()
                     .ok_or_else(|| {
@@ -1013,9 +1114,11 @@ impl NativeNodes {
             }
         };
 
-        // we upgrade only if existing node binary is not the latest version
+        // we upgrade only if existing node binary is not the latest version, or if the
+        // bootstrap peers file is missing (e.g. installs which predate its extraction)
         if let Ok(version) = self.read_node_version(None).await
             && version == version_to_download
+            && bootstrap_peers_path.exists()
         {
             logging::log!(
                 "[NodeMgr] Master node binary is already up to date (version v{version})"
@@ -1058,7 +1161,12 @@ impl NativeNodes {
 
         // Extract the binary from the archive
         let bin_path = self.root_dir.join(NODE_BIN_NAME);
-        if let Err(err) = extract_binary_from_archive(&archive_path, NODE_BIN_NAME, &bin_path) {
+        if let Err(err) = extract_binary_from_archive(
+            &archive_path,
+            NODE_BIN_NAME,
+            &bin_path,
+            &bootstrap_peers_path,
+        ) {
             logging::error!("[ERROR][NodeMgr] Failed to extract node binary from archive: {err}");
             return Err(err);
         }
@@ -1093,7 +1201,11 @@ impl NativeNodes {
         // we remove 'node_identity.key' file so the node will re-generate it when restarted.
         let node_data_dir = self.get_node_data_dir(node_info, true);
         let file_path = node_data_dir.join(NODE_IDENTITY_KEY_FILE);
-        remove_file(file_path).await?;
+        if let Err(err) = remove_file(file_path).await
+            && err.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(err.into());
+        }
 
         // restart node to obtain a new peer-id
         let _res = self.kill_node(&node_info.node_id).await;
@@ -1150,7 +1262,7 @@ impl NativeNodes {
 
         let mut file = File::open(log_file_path).await?;
         let file_length = file.metadata().await?.len();
-        if file_length > 1024 {
+        if file_length > 2048 {
             file.seek(SeekFrom::Start(file_length - 2048u64)).await?;
         }
         let mut reader = BufReader::new(file);
@@ -1170,6 +1282,7 @@ impl NativeNodes {
                     continue;
                 }
 
+                chunk.truncate(bytes_read);
                 yield Ok(Bytes::from(chunk));
                 max_iter = 180;
             }

@@ -59,7 +59,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           push: true
           provenance: false
-          tags: bochaco/formicaio-gh:build-native-${{ matrix.suffix }}-${{ github.run_id }}
+          tags: ${{ vars.DOCKERHUB_USERNAME }}/formicaio-gh:build-native-${{ matrix.suffix }}-${{ github.run_id }}
           cache-from: type=gha,scope=native-${{ matrix.suffix }}
           cache-to: type=gha,mode=max,scope=native-${{ matrix.suffix }}
           build-args: |
@@ -83,5 +83,5 @@ jobs:
           docker buildx imagetools create \
             -t ${{ vars.DOCKERHUB_USERNAME }}/formicaio:${{ needs.extract_version.outputs.version }}-native \
             -t ${{ vars.DOCKERHUB_USERNAME }}/formicaio:latest-native \
-            bochaco/formicaio-gh:build-native-amd64-${{ github.run_id }} \
-            bochaco/formicaio-gh:build-native-arm64-${{ github.run_id }}
+            ${{ vars.DOCKERHUB_USERNAME }}/formicaio-gh:build-native-amd64-${{ github.run_id }} \
+            ${{ vars.DOCKERHUB_USERNAME }}/formicaio-gh:build-native-arm64-${{ github.run_id }}

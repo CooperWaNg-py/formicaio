@@ -17,6 +17,10 @@ pub enum ActionsBatchError {
     InvalidAddress(String),
     #[error("Cannot create batch {0}: No node IDs provided.")]
     MissingNodeId(BatchType),
+    #[error("Cannot create batch: the number of nodes to create must be greater than zero.")]
+    InvalidNodesCount,
+    #[error("Cannot create batch of {count} nodes: ports starting at {port} exceed 65535.")]
+    PortsOutOfRange { port: u16, count: u16 },
 }
 
 // Helper to prepare a node actions batch
@@ -28,7 +32,19 @@ pub async fn prepare_node_action_batch(
     node_manager: &NodeManager,
 ) -> Result<u16, ActionsBatchError> {
     match &batch_type {
-        BatchType::Create { node_opts, .. } => {
+        BatchType::Create { node_opts, count } => {
+            if *count == 0 {
+                return Err(ActionsBatchError::InvalidNodesCount);
+            }
+            // each node gets port/metrics_port + its index in the batch
+            for port in [node_opts.port, node_opts.metrics_port] {
+                if port.checked_add(count - 1).is_none() {
+                    return Err(ActionsBatchError::PortsOutOfRange {
+                        port,
+                        count: *count,
+                    });
+                }
+            }
             // validate rewards address before accepting the batch
             parse_and_validate_addr(&node_opts.rewards_addr)
                 .map_err(ActionsBatchError::InvalidAddress)?;
@@ -66,7 +82,7 @@ pub async fn prepare_node_action_batch(
     let len = {
         let batches = &mut app_ctx.node_action_batches.write().await.1;
         batches.push(batch_info);
-        batches.iter().filter(|b| !b.status.is_failed()).count()
+        batches.iter().filter(|b| !b.status.is_finished()).count()
     };
 
     // spawn a task if there was no other tasks already batched
@@ -97,6 +113,7 @@ async fn run_batches(app_ctx: AppContext, node_manager: NodeManager) {
             return;
         };
 
+        let mut cancelled = false;
         match batch_info.batch_type {
             BatchType::Create {
                 ref node_opts,
@@ -111,6 +128,7 @@ async fn run_batches(app_ctx: AppContext, node_manager: NodeManager) {
                         batch_id = cancel_rx.recv() => {
                             if matches!(batch_id, Ok(id) if id == batch_info.id) {
                                 unlock_batched_nodes(&app_ctx, &batch_info.batch_type).await;
+                                cancelled = true;
                                 break;
                             }
                         },
@@ -141,6 +159,7 @@ async fn run_batches(app_ctx: AppContext, node_manager: NodeManager) {
                         batch_id = cancel_rx.recv() => {
                             if matches!(batch_id, Ok(id) if id == batch_info.id) {
                                 unlock_batched_nodes(&app_ctx, &batch_info.batch_type).await;
+                                cancelled = true;
                                 break;
                             }
                         },
@@ -167,16 +186,17 @@ async fn run_batches(app_ctx: AppContext, node_manager: NodeManager) {
             }
         }
 
+        // failed batches stay listed until dismissed, unless the user cancelled them
         app_ctx
             .node_action_batches
             .write()
             .await
             .1
-            .retain(|batch| batch.id != batch_info.id || batch.status.is_failed());
+            .retain(|batch| batch.id != batch_info.id || (!cancelled && batch.status.is_failed()));
     }
 }
 
-async fn unlock_batched_nodes(app_ctx: &AppContext, batch_type: &BatchType) {
+pub async fn unlock_batched_nodes(app_ctx: &AppContext, batch_type: &BatchType) {
     for node_id in batch_type.ids().iter() {
         app_ctx.node_status_locked.remove(node_id).await;
         app_ctx.db_client.unlock_node_status(node_id).await;

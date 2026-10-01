@@ -62,6 +62,8 @@ pub struct PaymentRecord {
     pub amount: U256,
     /// Block number where the payment was recorded
     pub block_number: u64,
+    /// Position of the payment's log within its block (None for records cached before it was tracked)
+    pub log_index: Option<u64>,
 }
 
 /// Client for querying payment data from Arbitrum L2
@@ -145,6 +147,8 @@ impl ArbitrumClient {
         // Phase 1: collect cached payments and missing ranges per address
         let mut cached_per_addr: HashMap<Address, HashSet<PaymentRecord>> = HashMap::new();
         let mut missing_ranges: Vec<(u64, u64)> = Vec::new();
+        // Last fully synced block per address, so merged ranges don't store its payments twice.
+        let mut synced_to: HashMap<Address, u64> = HashMap::new();
 
         let current_block = provider
             .get_block_number()
@@ -162,7 +166,7 @@ impl ArbitrumClient {
                 .await
                 .unwrap_or_default();
             // Use last synced block+1 when available
-            let requested_from = max_cached.unwrap_or(default_from);
+            let requested_from = max_cached.map_or(default_from, |bn| bn + 1);
             let requested_to = current_block;
 
             // determine missing ranges for this address
@@ -170,6 +174,9 @@ impl ArbitrumClient {
                 missing_ranges.push((requested_from, requested_to));
             }
 
+            if let Some(bn) = max_cached {
+                synced_to.insert(*address, bn);
+            }
             cached_per_addr.insert(*address, cached);
         }
 
@@ -220,7 +227,13 @@ impl ArbitrumClient {
                 .to_block(BlockNumberOrTag::Number(to_block));
 
             match self
-                .get_logs_chunked(&provider, filter, &mut cached_per_addr, remaining_budget)
+                .get_logs_chunked(
+                    &provider,
+                    filter,
+                    &mut cached_per_addr,
+                    &synced_to,
+                    remaining_budget,
+                )
                 .await
             {
                 Ok((blocks_processed, completed)) => {
@@ -260,6 +273,7 @@ impl ArbitrumClient {
         provider: &impl Provider,
         base_filter: Filter,
         cached_per_addr: &mut HashMap<Address, HashSet<PaymentRecord>>,
+        synced_to: &HashMap<Address, u64>,
         max_blocks: u64,
     ) -> Result<(u64, bool), ArbitrumClientError> {
         let from_block = match base_filter.get_from_block() {
@@ -287,8 +301,16 @@ impl ArbitrumClient {
 
             match provider.get_logs(&filter).await {
                 Ok(logs) => {
-                    // cache in db
-                    self.cache_logs(logs, provider, cached_per_addr).await;
+                    // cache in db; on failure retry this chunk on the next cycle
+                    if let Err(err) = self
+                        .cache_logs(logs, provider, cached_per_addr, synced_to)
+                        .await
+                    {
+                        logging::error!(
+                            "[ERROR][Arbitrum] Failed to cache logs from blocks {current} to {end}: {err}"
+                        );
+                        break;
+                    }
                     latest_cached_bn = end;
                     blocks_fetched += end - current + 1;
                     current = end + 1;
@@ -307,7 +329,13 @@ impl ArbitrumClient {
         if latest_cached_bn > 0 {
             for addr in &self.rewards_addresses {
                 self.db_client
-                    .store_earnings(addr, U256::ZERO, latest_cached_bn, Utc::now().timestamp())
+                    .store_earnings(
+                        addr,
+                        U256::ZERO,
+                        latest_cached_bn,
+                        None,
+                        Utc::now().timestamp(),
+                    )
                     .await;
             }
             logging::log!(
@@ -319,17 +347,21 @@ impl ArbitrumClient {
         Ok((blocks_fetched, completed))
     }
 
+    // Store the payments found in the logs. Nothing is stored if any block timestamp
+    // can't be retrieved, so the caller can retry the whole chunk later.
     async fn cache_logs(
         &self,
         logs: Vec<Log>,
         provider: &impl Provider,
         cached_per_addr: &mut HashMap<Address, HashSet<PaymentRecord>>,
-    ) {
+        synced_to: &HashMap<Address, u64>,
+    ) -> Result<(), ArbitrumClientError> {
         // Pre-filter logs to only those relevant to monitored addresses, and collect
         // unique block numbers so we fetch each block's timestamp only once.
         struct PendingLog {
             recipient: Address,
             block_number: u64,
+            log_index: Option<u64>,
             amount: U256,
         }
         let mut pending: Vec<PendingLog> = Vec::new();
@@ -353,17 +385,28 @@ impl ArbitrumClient {
                 Some(bn) => bn,
                 None => continue,
             };
+            if synced_to
+                .get(&recipient_addr)
+                .is_some_and(|synced| block_number <= *synced)
+            {
+                continue;
+            }
 
             let amount = if log.data().data.is_empty() {
                 U256::ZERO
             } else {
                 U256::from_be_slice(&log.data().data)
             };
+            // Zero-amount rows are sync-progress markers in the DB, not payments.
+            if amount == U256::ZERO {
+                continue;
+            }
 
             unique_blocks.insert(block_number);
             pending.push(PendingLog {
                 recipient: recipient_addr,
                 block_number,
+                log_index: log.log_index,
                 amount,
             });
         }
@@ -376,17 +419,25 @@ impl ArbitrumClient {
                 .await
             {
                 Ok(Some(b)) => b,
-                _ => continue,
+                Ok(None) => {
+                    return Err(ArbitrumClientError::RpcError(format!("Block #{bn} not found")));
+                }
+                Err(e) => return Err(ArbitrumClientError::RpcError(e.to_string())),
             };
-            if let Some(ts) = Utc.timestamp_opt(block.header.timestamp as i64, 0).single() {
-                block_timestamps.insert(bn, ts);
-            }
+            let ts = Utc
+                .timestamp_opt(block.header.timestamp as i64, 0)
+                .single()
+                .ok_or_else(|| {
+                    ArbitrumClientError::ParseError(format!("Invalid timestamp for block #{bn}"))
+                })?;
+            block_timestamps.insert(bn, ts);
         }
 
         // Now process each pending log using the cached timestamps.
         for PendingLog {
             recipient,
             block_number,
+            log_index,
             amount,
         } in pending
         {
@@ -396,7 +447,13 @@ impl ArbitrumClient {
             };
 
             self.db_client
-                .store_earnings(&recipient, amount, block_number, timestamp.timestamp())
+                .store_earnings(
+                    &recipient,
+                    amount,
+                    block_number,
+                    log_index,
+                    timestamp.timestamp(),
+                )
                 .await;
 
             cached_per_addr
@@ -406,7 +463,10 @@ impl ArbitrumClient {
                     timestamp,
                     amount,
                     block_number,
+                    log_index,
                 });
         }
+
+        Ok(())
     }
 }

@@ -1,0 +1,104 @@
+name: Umbrel community store image (GHCR)
+
+# Builds the `native` image used by the Formicaio community app store
+# (github.com/CooperWaNg-py/formicaio-app-store) and pushes it to GHCR as a
+# multi-arch manifest list. umbrelOS runs on linux/amd64 and linux/arm64, and the
+# store's docker-compose.yml pins the INDEX digest, which only a manifest list has.
+#
+# Uses the built-in GITHUB_TOKEN; no secrets needed. A package pushed to GHCR is
+# PRIVATE by default: after the first run make it public once at
+#   github.com/users/CooperWaNg-py/packages/container/formicaio/settings
+# or umbrelOS cannot pull it.
+#
+# Run with: gh workflow run umbrel_image.yml -f version=<umbrel app version>
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Image version, equal to the store's umbrel-app.yml version (e.g. 0.8.8-patch.1)"
+        required: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # GHCR rejects uppercase in image references, so this is the lowercased owner.
+  IMAGE: ghcr.io/cooperwang-py/formicaio
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            suffix: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            suffix: arm64
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Native per-arch runners: building Rust + WASM under QEMU takes hours.
+      - uses: docker/build-push-action@v6
+        with:
+          platforms: ${{ matrix.platform }}
+          push: true
+          provenance: false
+          tags: ${{ env.IMAGE }}:build-${{ inputs.version }}-native-${{ matrix.suffix }}
+          cache-from: type=gha,scope=umbrel-native-${{ matrix.suffix }}
+          cache-to: type=gha,mode=max,scope=umbrel-native-${{ matrix.suffix }}
+          build-args: |
+            BUILD_ARGS=--features native
+
+  publish:
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge per-arch images into a multi-platform tag
+        run: |
+          docker buildx imagetools create \
+            -t ${{ env.IMAGE }}:${{ inputs.version }}-native \
+            ${{ env.IMAGE }}:build-${{ inputs.version }}-native-amd64 \
+            ${{ env.IMAGE }}:build-${{ inputs.version }}-native-arm64
+
+      # Fail loudly if the index lacks a platform, rather than letting a broken
+      # pull surface on the user's device.
+      - name: Verify both platforms are present
+        run: |
+          set -euo pipefail
+          out="$(docker buildx imagetools inspect "${{ env.IMAGE }}:${{ inputs.version }}-native" --raw)"
+          for p in '"architecture":"amd64"' '"architecture":"arm64"'; do
+            echo "$out" | tr -d ' \n' | grep -q "$p" || { echo "missing platform $p"; exit 1; }
+          done
+
+      # The reference to paste into the store's docker-compose.yml.
+      - name: Report index digest
+        run: |
+          digest="$(docker buildx imagetools inspect "${{ env.IMAGE }}:${{ inputs.version }}-native" --format '{{json .Manifest}}' | jq -r .digest)"
+          {
+            echo "### Image published"
+            echo '```'
+            echo "${{ env.IMAGE }}:${{ inputs.version }}-native@${digest}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
