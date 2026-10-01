@@ -1,11 +1,22 @@
 manifestVersion: 1
-id: formicaio
+# `id` MUST equal this directory's name AND start with the store id
+# (`formicaio-community`); umbrelOS silently drops apps that fail
+# `app.id.startsWith(store.id)`. It also keeps this app separate from the
+# official `formicaio` app, so both can be listed without colliding.
+id: formicaio-community-formicaio
+category: crypto
 name: Formicaio
+# umbrelOS decides whether to offer an update by comparing ONLY this version.
+# Bump it in the same commit as (or after) the new image digest in
+# docker-compose.yml, never before.
+version: "0.8.8-patch.1"
 tagline: Run nodes on the Autonomi peer-to-peer (P2P) network
-category: networking
-version: "0.6.0"
-port: 52101 # Published version on umbrel app store will run on port 52100
 description: >-
+  Community build of Formicaio from github.com/CooperWaNg-py/formicaio. It
+  tracks upstream Formicaio 0.8.8 plus fixes, and runs on its own ports, so it
+  does not collide with the official Formicaio app.
+
+
   ## Simplify your decentralized experience with Formicaio
 
   Formicaio is an intuitive application designed to help you run nodes on
@@ -15,9 +26,7 @@ description: >-
 
   The name "Formicaio" is derived from the Italian word for "anthill"
   symbolizing the collaborative and structured nature of both ants and the
-  decentralized network it supports. Just as ants work together to build and
-  maintain their colonies, Formicaio empowers users to collaborate and contribute
-  to the Autonomi network.
+  decentralized network it supports.
 
   ## Node management made easy
 
@@ -25,23 +34,22 @@ description: >-
   user interface (GUI) or a terminal. This flexibility allows you to perform
   various actions on individual nodes or groups of selected nodes, including:
   - Creating new nodes
-  - Starting or stopping nodes
+  - Starting or stopping nodes individually or in batches
   - Recycling nodes to generate a new peer ID
   - Removing nodes
   - Upgrading nodes when a new binary version is available
   - Viewing individual node logs in real time
   - Monitoring memory and CPU usage with detailed charts
-  - Sorting nodes by different criteria, such as creation date, status, or number of connected peers
+  - Sorting nodes by different criteria, such as creation date, status, or binary version
+  - Switching between tile and list layouts in the nodes page
+  - Terminal to query and manage nodes through a CLI
 
   The Formicaio backend actively monitors your nodes, providing real-time
   status updates and statistics, including:
   - Rewards balance for each node
   - Memory and CPU usage
   - Number of records stored locally
-  - Current peer connections
-  - Peers in the routing table
-  - Peers that have shunned the node(s)
-  - Estimated total nodes in the network
+  - Disk usage
 
   ## Customizable monitoring and management
 
@@ -51,20 +59,40 @@ description: >-
   - Frequency of version checks for the node binary
   - Frequency of token balance queries
   - Frequency of metrics and node information retrieval
+  - Frequency of disk usage checks
+  - Nodes page default layout (tile or list) and page size
+  - Rewards monitoring (enable/disable automatic balance checks and earnings analytics)
   - Configuration of the ERC20 token contract address and RPC URL for reward balance queries
-  - Displaying node statistics on an external LCD device (via I2C interface)
+  - LCD display configuration for external monitoring on Raspberry Pi (I2C)
 
-  ## Connection types for nodes
+  ## AI Agent and MCP Server
 
-  When setting up nodes, you can define their connection type and custom data directory:
-  - UPnP support: Attempts to use UPnP to open a port on your home router for incoming connections. If your router doesn't support UPnP, create nodes with UPnP disabled to ensure connectivity.
-  - Listening IP address: This address determines which network interface the node will bind to for incoming connections. The application supports both IPv4 (e.g., `0.0.0.0`, `127.0.0.1`) and IPv6 (e.g., `::`, `fe80::1`) addresses, allowing users to control whether the node is accessible on all interfaces, only locally, or on a specific network. This flexibility is useful for running nodes in different environments, such as local development, private networks, or public-facing deployments.
-  - Custom data directory: This directory is where the node will store its persistent data, such as chunks, logs, and configuration files. By assigning a unique data directory to each node, or batch of nodes, users can run multiple nodes on the same machine without data conflicts. This option is especially valuable for advanced setups or when running nodes with different hard disks or mounting points.
+  Formicaio includes a built-in AI agent that lets you manage your nodes through
+  natural language, using any OpenAI-compatible LLM backend on your machine or
+  local network (Ollama, LM Studio, llama.cpp server, Jan, etc.). It can also
+  monitor your fleet autonomously in the background; in that mode it may only
+  inspect nodes and start stopped ones.
+developer: bochaco
+website: https://github.com/bochaco/formicaio
+submitter: CooperWaNg-py
+submission: https://github.com/CooperWaNg-py/formicaio-app-store
+repo: https://github.com/CooperWaNg-py/formicaio
+support: https://github.com/CooperWaNg-py/formicaio/issues
+port: 52102
+# Community stores use `icon` and `gallery` verbatim; the default fallback
+# (getumbrel.github.io/umbrel-apps-gallery/<id>/...) 404s for this app id, so
+# both MUST be absolute URLs. Assets live in this repo under assets/.
+icon: https://raw.githubusercontent.com/CooperWaNg-py/formicaio-app-store/main/assets/icon.svg
+gallery:
+  - https://raw.githubusercontent.com/CooperWaNg-py/formicaio-app-store/main/assets/gallery/1.jpg
+  - https://raw.githubusercontent.com/CooperWaNg-py/formicaio-app-store/main/assets/gallery/2.jpg
+  - https://raw.githubusercontent.com/CooperWaNg-py/formicaio-app-store/main/assets/gallery/3.jpg
 widgets:
   - id: "formicaio-stats"
     type: "four-stats"
     refresh: "5s"
-    endpoint: "formicaio_proxy:52101/api/stats_widget"
+    # <service>:<port> inside this app's compose project.
+    endpoint: "proxy:52102/api/stats_widget"
     link: ""
     example:
       type: "four-stats"
@@ -79,30 +107,31 @@ widgets:
         - title: "Stored records"
           text: "69"
           subtext: ""
-        - title: "Network size"
-          text: "3897207"
+        - title: "Disk used"
+          text: "1.25 GB"
           subtext: ""
-developer: bochaco
-website: https://github.com/bochaco/formicaio
-submitter: bochaco
-submission: https://github.com/getumbrel/umbrel-apps/pull/1565
 dependencies: []
-repo: https://github.com/bochaco/formicaio
-support: https://github.com/bochaco/formicaio/issues
-gallery:
-  - https://raw.githubusercontent.com/bochaco/formicaio/refs/heads/main/img/screenshot_01.png
-  - https://raw.githubusercontent.com/bochaco/formicaio/refs/heads/main/img/screenshot_02.png
-  - https://raw.githubusercontent.com/bochaco/formicaio/refs/heads/main/img/screenshot_03.png
-  - https://raw.githubusercontent.com/bochaco/formicaio/refs/heads/main/img/screenshot_04.png
-  - https://raw.githubusercontent.com/bochaco/formicaio/refs/heads/main/img/screenshot_05.png
-  - https://raw.githubusercontent.com/bochaco/formicaio/refs/heads/main/img/lcd_00.png
-  - https://raw.githubusercontent.com/bochaco/formicaio/refs/heads/main/img/lcd_01.png
-  - https://raw.githubusercontent.com/bochaco/formicaio/refs/heads/main/img/lcd_02.png
-releaseNotes: >-
-  This initial version lays the foundation for future development,
-  with additional features to be introduced in subsequent updates.
-
-  This first version of the Formicaio app allows to run a few
-  nodes on the Autonomi P2P network. No other features are still available
-  in this first version.
 path: ""
+defaultUsername: ""
+defaultPassword: ""
+releaseNotes: >-
+  Nodes start again. Formicaio 0.8.4 (the official Umbrel app) passes
+  --bootstrap-cache-dir, which current ant-node releases reject, so every
+  node start or restart ended with "Exited (exit status: 2)". This build is
+  based on Formicaio 0.8.8, which no longer passes it.
+
+
+  New nodes now join the network: ant-node's bootstrap_peers.toml is kept
+  next to the node binary, where before nodes started with no bootstrap
+  peers and never connected.
+
+
+  Other fixes: node status no longer freezes after a node upgrades itself
+  twice; a restarted app no longer mistakes another node's process for a
+  stale one; deleting a node always stops its process; stored records, CPU
+  and memory are shown again (system metrics are the default); cancelling a
+  queued batch works; the autonomous AI agent can no longer delete, stop,
+  recycle or upgrade nodes; a failed binary download no longer restarts all
+  nodes on every version check; earnings no longer miss or double-count
+  payments; the widget shows disk used instead of an always-zero network
+  size; the web UI is no longer reachable from the LAN without Umbrel's login.

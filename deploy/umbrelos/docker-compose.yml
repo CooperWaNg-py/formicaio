@@ -1,30 +1,62 @@
+version: "3.7"
+
+# Images are multi-arch manifest lists (linux/amd64 + linux/arm64). Pin the INDEX
+# digest, not a per-platform one, or one architecture fails to pull:
+#   docker buildx imagetools inspect ghcr.io/cooperwang-py/formicaio:<version>-native
+# The formicaio image is built from github.com/CooperWaNg-py/formicaio by
+# .github/workflows/umbrel_image.yml.
+
 services:
+  # Required stub: umbrelOS only merges its app_proxy fragment if the service is
+  # declared here. The host is the injected container name <app-id>_<service>_1.
   app_proxy:
     environment:
-      APP_HOST: formicaio-apps-formicaio_formicaio_proxy_1
-      APP_PORT: 52101
-    container_name: formicaio-apps-formicaio_app_proxy_1
-  formicaio_proxy:
-    image: bochaco/formicaio_proxy:0.3.0
-    user: 1000:1000
+      APP_HOST: formicaio-community-formicaio_proxy_1
+      APP_PORT: 52102
+
+  # app_proxy lives on Umbrel's bridge network and cannot reach a host-network
+  # container by name, so this small proxy forwards to Formicaio on the host.
+  # It also serves the widget endpoint declared in umbrel-app.yml.
+  proxy:
+    image: bochaco/formicaio_proxy:0.3.0@sha256:49a8f7b1787aa356c9c444fe75b90fbd09da4d9a0be00c3f753e997a3196e1f9
+    user: "1000:1000"
+    restart: on-failure
     environment:
-      FORMICAIO_ADDR: host.docker.internal:3100
-      FORMICAIO_PROXY_PORT: 52101
+      FORMICAIO_ADDR: host.docker.internal:52104
+      FORMICAIO_PROXY_PORT: 52102
     extra_hosts:
       - host.docker.internal:host-gateway
-    container_name: formicaio-apps-formicaio_formicaio_proxy_1
+
   formicaio:
-    image: bochaco/formicaio:0.6.2-native
-    privileged: true
+    image: ghcr.io/cooperwang-py/formicaio:0.8.8-patch.1-native@sha256:0e927cd67900d9d92991af3a1f8d8cd4cb2008862f8cb42de59e683a024e298c
     restart: on-failure
+    # Host networking: every node listens on its own P2P port and may use UPnP.
     network_mode: host
-    stop_grace_period: 5s
+    # tini as PID 1: forwards SIGTERM to formicaio (which, as PID 1, would ignore
+    # it) and reaps ant-node processes that re-exec themselves on self-upgrade.
+    init: true
+    stop_grace_period: 10s
+    # Bind the web UI only to the Docker host-gateway address the proxy dials,
+    # not 0.0.0.0: with host networking a wildcard bind would publish the UI,
+    # unauthenticated, on every LAN interface and bypass Umbrel's login.
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    command:
+      - sh
+      - -c
+      - >-
+        addr="$$(getent ahostsv4 host.docker.internal | awk 'NR==1 {print $$1}')";
+        [ -n "$$addr" ] || { echo "cannot resolve host.docker.internal" >&2; exit 1; };
+        exec /app/formicaio start --addr "$$addr:52104"
     environment:
       DB_PATH: /data
       NODE_MGR_ROOT_DIR: /data
-      LEPTOS_SITE_ADDR: 0.0.0.0:3100
     volumes:
       - ${APP_DATA_DIR}/data/formicaio:/data
-    devices:
+      # I2C access for the optional LCD display. /dev is bind-mounted rather
+      # than listed under `devices:` so the container still starts on hosts
+      # where /dev/i2c-* does not exist, and the cgroup rule grants only the
+      # I2C char major (89) instead of `privileged: true`.
       - /dev:/dev
-    container_name: formicaio-apps-formicaio_formicaio_1
+    device_cgroup_rules:
+      - "c 89:* rmw"
